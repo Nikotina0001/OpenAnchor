@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a reproducible OpenAnchor problem.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: "Please remove private paths, credentials and printer data from attachments. Share models only if you have redistribution rights."
+  - type: input
+    id: versions
+    attributes:
+      label: Versions and environment
+      description: OpenAnchor version, exact OrcaSlicer build, OS and whether the native bridge is installed.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include relevant dimensions, normal/advanced mode and Export/Apply workflow.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Diagnostics or minimal example
+      description: Sanitized logs, screenshots and a small shareable model are helpful. Mark physical observations separately from Preview results.

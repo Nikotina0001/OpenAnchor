@@ -1,0 +1,1 @@
+run_id,condition,replicate,main_filament,anchor_filament,bed_c,nozzle_main_c,nozzle_anchor_c,chamber_c,flange_height_mm,overlap_mm,max_corner_lift_mm,success,anchor_detached,removal_force_n,dimensional_error_mm,notes

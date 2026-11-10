@@ -1,0 +1,590 @@
+diff --git a/localization/i18n/list.txt b/localization/i18n/list.txt
+index 8f9dda067..e8fa42e24 100644
+--- a/localization/i18n/list.txt
++++ b/localization/i18n/list.txt
+@@ -394,3 +394,4 @@ src/slic3r/GUI/PostProcessor.cpp
+ src/slic3r/GUI/TaskManager.cpp
+ src/slic3r/GUI/Widgets/ProgressDialog.hpp
+ src/slic3r/GUI/Widgets/StepCtrl.cpp
++src/slic3r/plugin/host/PluginHostApp.cpp
+diff --git a/src/libslic3r/Model.hpp b/src/libslic3r/Model.hpp
+index 6d9797ff6..51efd06b2 100644
+--- a/src/libslic3r/Model.hpp
++++ b/src/libslic3r/Model.hpp
+@@ -58,6 +58,7 @@ namespace cereal {
+ }
+ 
+ namespace Slic3r {
++namespace anchor_plate { struct ModelAccess; }
+ 
+ struct TexturedMesh;
+ enum class ConversionType;
+@@ -578,6 +579,7 @@ public:
+     bool has_connectors() const;
+ private:
+     friend class Model;
++    friend struct anchor_plate::ModelAccess;
+     // This constructor assigns new ID to this ModelObject and its config.
+     explicit ModelObject(Model* model) : m_model(model), origin_translation(Vec3d::Zero())
+     {
+diff --git a/src/slic3r/plugin/host/PluginHostApp.cpp b/src/slic3r/plugin/host/PluginHostApp.cpp
+index b7fb1cdad..54248f547 100644
+--- a/src/slic3r/plugin/host/PluginHostApp.cpp
++++ b/src/slic3r/plugin/host/PluginHostApp.cpp
+@@ -1,9 +1,19 @@
++#ifdef _WIN32
++#include <wx/msw/wrapcctl.h>
++#endif
++
+ #include "PluginHostBindings.hpp"
++#include "AnchorPlateEdit.hpp"
+ #include <pybind11/cast.h>
+ #include <pybind11/pybind11.h>
+ #include <pybind11/pytypes.h>
++#include <pybind11/stl.h>
+ 
+ #include <libslic3r/Model.hpp>
++#include <libslic3r/Format/bbs_3mf.hpp>
++#include <libslic3r/ObjectID.hpp>
++#include <libslic3r/Point.hpp>
++#include <libslic3r/TriangleMesh.hpp>
+ #include <libslic3r/PresetBundle.hpp>
+ #include <libslic3r/AppConfig.hpp>
+ #include <libslic3r/Semver.hpp>
+@@ -13,7 +23,10 @@
+ #include <slic3r/GUI/DeviceManager.hpp>
+ #include <slic3r/GUI/GUI.hpp>
+ #include <slic3r/GUI/GUI_App.hpp>
++#include <slic3r/GUI/GUI_ObjectList.hpp>
++#include <slic3r/GUI/I18N.hpp>
+ #include <slic3r/GUI/OpenGLManager.hpp>
++#include <slic3r/GUI/PartPlate.hpp>
+ #include <slic3r/GUI/Plater.hpp>
+ #include <slic3r/Utils/CloudProvider.hpp>
+ #include <slic3r/Utils/NetworkAgent.hpp>
+@@ -25,6 +38,12 @@
+ #include <boost/optional/optional.hpp>
+ 
+ #include <memory>
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <limits>
++#include <optional>
++#include <vector>
+ #include <stdexcept>
+ #include <wx/app.h>
+ #include <wx/string.h>
+@@ -92,6 +111,144 @@ void export_3mf_copy(GUI::Plater& plater, const std::string& path)
+         throw std::runtime_error("Failed to write " + path);
+ }
+ 
++ObjectID anchor_id(py::handle value)
++{
++    const std::string text = py::cast<std::string>(value);
++    if (text.empty() || !std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; }))
++        throw py::value_error("OpenAnchor IDs must be positive decimal strings");
++    const auto id = std::stoull(text);
++    if (id == 0 || id > std::numeric_limits<size_t>::max())
++        throw py::value_error("Invalid OpenAnchor ID");
++    return ObjectID(size_t(id));
++}
++
++TriangleMesh anchor_mesh(const py::dict& data)
++{
++    const auto vertices = data["vertices"].cast<std::vector<std::array<double, 3>>>();
++    const auto triangles = data["triangles"].cast<std::vector<std::array<int, 3>>>();
++    indexed_triangle_set mesh;
++    mesh.vertices.reserve(vertices.size());
++    mesh.indices.reserve(triangles.size());
++    for (const auto& vertex : vertices)
++        mesh.vertices.emplace_back(float(vertex[0]), float(vertex[1]), float(vertex[2]));
++    for (const auto& face : triangles)
++        mesh.indices.emplace_back(face[0], face[1], face[2]);
++    return anchor_plate::checked_mesh(std::move(mesh));
++}
++
++py::dict instance_plate(GUI::Plater& plater, const std::string& object_id, int instance)
++{
++    require_main_thread("instance_plate");
++    const ObjectID id = anchor_id(py::str(object_id));
++    const auto& objects = plater.model().objects;
++    const auto it = std::find_if(objects.begin(), objects.end(), [&](const ModelObject* object) { return object->id() == id; });
++    if (it == objects.end() || instance < 0 || size_t(instance) >= (*it)->instances.size())
++        throw py::value_error("Object or instance changed; refresh the object list");
++    auto& plates = plater.get_partplate_list();
++    const int index = plates.find_instance(int(it - objects.begin()), instance);
++    if (index < 0 || index >= plates.get_plate_count())
++        throw py::value_error("The selected instance does not belong to a plate");
++    const Vec3d origin = plates.get_plate(index)->get_origin();
++    py::dict result;
++    result["index"] = index;
++    result["origin"] = std::array<double, 3>{origin.x(), origin.y(), origin.z()};
++    return result;
++}
++
++void refresh_anchor_object(GUI::Plater& plater, int index)
++{
++    ModelObject& object = *plater.model().objects[index];
++    // ensure_on_bed must not move a sunk or raised original part while refreshing.
++    const bool auto_drop = object.auto_drop;
++    object.auto_drop = false;
++    try {
++        plater.changed_object(index);
++    } catch (...) {
++        object.auto_drop = auto_drop;
++        throw;
++    }
++    object.auto_drop = auto_drop;
++    plater.object_list_changed();
++}
++
++py::dict edit_anchor(GUI::Plater& plater, const py::dict& request, bool restore)
++{
++    require_main_thread(restore ? "restore_anchor" : "apply_anchor");
++    static bool editing = false;
++    if (editing)
++        throw py::value_error("An OpenAnchor edit is already running");
++    struct EditGuard {
++        bool& flag;
++        explicit EditGuard(bool& flag) : flag(flag) { flag = true; }
++        ~EditGuard() { flag = false; }
++    } edit_guard(editing);
++    if (plater.is_loading_project() || plater.inside_snapshot_capture())
++        throw py::value_error("Wait for the current project operation to finish");
++    anchor_plate::Target target;
++    target.object_id = anchor_id(request["object_id"]);
++    target.source_volume_id = anchor_id(request["source_volume_id"]);
++    target.instance = request["instance"].cast<int>();
++    for (py::handle id : request["generated_volume_ids"].cast<py::list>())
++        target.generated_volume_ids.push_back(anchor_id(id));
++    if (!target.generated_volume_ids.empty()) {
++        if (!request.contains("original_extruder") || !request.contains("original_brim"))
++            throw py::value_error("Original OpenAnchor settings are missing; refusing to change the object");
++        if (!request["original_extruder"].is_none())
++            target.original_extruder = request["original_extruder"].cast<std::string>();
++        if (!request["original_brim"].is_none())
++            target.original_brim = request["original_brim"].cast<std::string>();
++    }
++    Model& model = plater.model();
++    const auto it = std::find_if(model.objects.begin(), model.objects.end(), [&](const ModelObject* object) {
++        return object->id() == target.object_id;
++    });
++    if (it == model.objects.end())
++        throw py::value_error("Object was removed; refresh the object list");
++    const int index = int(it - model.objects.begin());
++    int main_slot = 0, anchor_slot = 0;
++    TriangleMesh flange, anchor;
++    if (!restore) {
++        main_slot = request["main_slot"].cast<int>();
++        anchor_slot = request["anchor_slot"].cast<int>();
++        const size_t slots = current_preset_bundle()->filament_presets.size();
++        if (main_slot < 1 || anchor_slot < 1 || size_t(main_slot) > slots || size_t(anchor_slot) > slots)
++            throw py::value_error("Selected filament slot is unavailable");
++        flange = anchor_mesh(request["flange"].cast<py::dict>());
++        anchor = anchor_mesh(request["anchor"].cast<py::dict>());
++    }
++    auto staged = anchor_plate::stage(**it, target, restore, std::move(flange), std::move(anchor), main_slot, anchor_slot);
++    // Allocate the Python result before committing so Python allocation failures leave the model intact.
++    py::dict result;
++    result["object_id"] = std::to_string(staged.record.object_id.id);
++    result["source_volume_id"] = std::to_string(staged.record.source_volume_id.id);
++    py::list generated_ids;
++    for (ObjectID id : staged.record.generated_volume_ids)
++        generated_ids.append(std::to_string(id.id));
++    result["generated_volume_ids"] = generated_ids;
++    result["original_extruder"] = py::cast(staged.record.original_extruder);
++    result["original_brim"] = py::cast(staged.record.original_brim);
++    GUI::ObjectList* object_list = current_app().obj_list();
++    if (object_list == nullptr)
++        throw std::runtime_error("Object list is not available");
++    GUI::Plater::TakeSnapshot snapshot(&plater, GUI::I18N::translate_utf8(restore ? L("Restore original model") : L("Apply OpenAnchor")));
++    anchor_plate::ObjectPtr original(*it);
++    anchor_plate::ModelAccess::attach(*staged.object, &model);
++    *it = staged.object.get();
++    try {
++        object_list->reload_all_plates();
++        refresh_anchor_object(plater, index);
++        save_object_mesh(*staged.object);
++    } catch (...) {
++        *it = original.release();
++        // Rebuild the UI against the restored model if a refresh fails after the pointer swap.
++        object_list->reload_all_plates();
++        refresh_anchor_object(plater, index);
++        throw;
++    }
++    staged.object.release();
++    return result;
++}
++
+ py::object gl_info()
+ {
+     const GUI::OpenGLManager::GLInfo& info = GUI::OpenGLManager::get_gl_info();
+@@ -161,6 +318,12 @@ void host_bindings::register_app(py::module_& host)
+         .def("is_project_dirty", &GUI::Plater::is_project_dirty)
+         .def("is_presets_dirty", &GUI::Plater::is_presets_dirty)
+         .def("inside_snapshot_capture", &GUI::Plater::inside_snapshot_capture)
++        .def("instance_plate", &instance_plate, py::arg("object_id"), py::arg("instance"),
++             "Plate index and world origin for a model instance; requires the UI thread.")
++        .def("apply_anchor", [](GUI::Plater& plater, const py::dict& request) { return edit_anchor(plater, request, false); }, py::arg("request"),
++             "Atomically add or replace the two OpenAnchor parts of a single-instance object; records one Undo action.")
++        .def("restore_anchor", [](GUI::Plater& plater, const py::dict& request) { return edit_anchor(plater, request, true); }, py::arg("request"),
++             "Remove the expected OpenAnchor parts and restore the original material and brim overrides.")
+         // Path the project was last opened from or saved to; empty while it has never been saved.
+         .def("project_path", [](GUI::Plater& plater) {
+             require_main_thread("project_path");
+diff --git a/tests/slic3rutils/CMakeLists.txt b/tests/slic3rutils/CMakeLists.txt
+index a05426e05..aa5d9a8eb 100644
+--- a/tests/slic3rutils/CMakeLists.txt
++++ b/tests/slic3rutils/CMakeLists.txt
+@@ -29,6 +29,7 @@ add_executable(${_TEST_NAME}_tests
+     test_action_source.cpp
+     test_option_state_registry.cpp
+     test_plugin_host_api.cpp
++    test_anchor_plate_edit.cpp
+     # Exercise seam enums and predicates through the embedded Python host API.
+     test_precise_seam_plugin.cpp
+     test_plugin_capability_config.cpp
+diff --git a/tests/slic3rutils/test_plugin_host_api.cpp b/tests/slic3rutils/test_plugin_host_api.cpp
+index bcb95ecce..1445200c0 100644
+--- a/tests/slic3rutils/test_plugin_host_api.cpp
++++ b/tests/slic3rutils/test_plugin_host_api.cpp
+@@ -337,6 +337,9 @@ TEST_CASE("Plugin host API reports no GL details before the 3D view exists", "[P
+     py::object plater_type = host.attr("Plater");
+     CHECK(has_attr(plater_type, "project_path"));
+     CHECK(has_attr(plater_type, "export_3mf_copy"));
++    CHECK(has_attr(plater_type, "apply_anchor"));
++    CHECK(has_attr(plater_type, "instance_plate"));
++    CHECK(has_attr(plater_type, "restore_anchor"));
+ }
+ 
+ TEST_CASE("Plugin host API exposes the UI module and guards it before Orca app initialization", "[PluginHost][Python]")
+diff --git a/src/slic3r/plugin/host/AnchorPlateEdit.hpp b/src/slic3r/plugin/host/AnchorPlateEdit.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/slic3r/plugin/host/AnchorPlateEdit.hpp
+@@ -0,0 +1,169 @@
++#pragma once
++
++#include <libslic3r/Config.hpp>
++#include <libslic3r/Model.hpp>
++#include <libslic3r/ObjectID.hpp>
++#include <libslic3r/Point.hpp>
++#include <libslic3r/PrintConfig.hpp>
++#include <libslic3r/TriangleMesh.hpp>
++
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <map>
++#include <memory>
++#include <optional>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace Slic3r::anchor_plate {
++
++// Keep ID-preserving copy and destruction scoped to the staged plate edit.
++struct ModelAccess {
++    void operator()(ModelObject* object) const { delete object; }
++    static ModelObject* copy(const ModelObject& source) { return ModelObject::new_copy(source); }
++    static void attach(ModelObject& object, Model* model) { object.set_model(model); }
++};
++using ObjectPtr = std::unique_ptr<ModelObject, ModelAccess>;
++
++struct Target {
++    ObjectID object_id;
++    ObjectID source_volume_id;
++    int instance = 0;
++    std::vector<ObjectID> generated_volume_ids;
++    std::optional<std::string> original_extruder;
++    std::optional<std::string> original_brim;
++};
++
++struct StagedEdit {
++    ObjectPtr object;
++    Target record;
++};
++
++inline TriangleMesh checked_mesh(indexed_triangle_set mesh)
++{
++    if (mesh.vertices.empty() || mesh.indices.empty())
++        throw std::invalid_argument("Anchor mesh is empty");
++    for (const Vec3f& vertex : mesh.vertices)
++        if (!vertex.allFinite())
++            throw std::invalid_argument("Anchor mesh has a non-finite vertex");
++    // Count both incident faces and direction; open, non-manifold and reversed edges are rejected.
++    std::map<std::pair<int, int>, std::pair<int, int>> edges;
++    for (const Vec3i32& face : mesh.indices) {
++        for (int i = 0; i < 3; ++i)
++            if (face[i] < 0 || size_t(face[i]) >= mesh.vertices.size())
++                throw std::invalid_argument("Anchor mesh has an invalid triangle index");
++        const Vec3d a = mesh.vertices[face[0]].cast<double>();
++        const Vec3d b = mesh.vertices[face[1]].cast<double>();
++        const Vec3d c = mesh.vertices[face[2]].cast<double>();
++        if ((b - a).cross(c - a).squaredNorm() == 0.)
++            throw std::invalid_argument("Anchor mesh has a degenerate triangle");
++        for (int i = 0; i < 3; ++i) {
++            int a = face[i], b = face[(i + 1) % 3];
++            auto& edge = edges[{std::min(a, b), std::max(a, b)}];
++            ++edge.first;
++            edge.second += a < b ? 1 : -1;
++        }
++    }
++    for (const auto& entry : edges)
++        if (entry.second.first != 2 || entry.second.second != 0)
++            throw std::invalid_argument("Anchor mesh must be closed and consistently oriented");
++    TriangleMesh result(std::move(mesh));
++    if (!result.stats().manifold() || !std::isfinite(result.volume()) || result.volume() <= 0.f)
++        throw std::invalid_argument("Anchor mesh must have positive enclosed volume");
++    return result;
++}
++
++inline std::optional<std::string> saved_option(const ModelConfig& config, const char* key)
++{
++    const ConfigOption* value = config.option(key);
++    return value == nullptr ? std::nullopt : std::optional<std::string>(value->serialize());
++}
++
++inline void restore_option(ModelConfig& config, const char* key, const std::optional<std::string>& value)
++{
++    if (value) {
++        ConfigSubstitutionContext context{ForwardCompatibilitySubstitutionRule::Disable};
++        config.set_deserialize(key, *value, context);
++    } else
++        config.erase(key);
++}
++
++inline StagedEdit stage(const ModelObject& source, Target target, bool restore,
++                       TriangleMesh flange = {}, TriangleMesh anchor = {}, int main_slot = 0, int anchor_slot = 0)
++{
++    if (source.id() != target.object_id || source.instances.size() != 1 || target.instance != 0)
++        throw std::invalid_argument("Refresh the object list; only objects with one instance can be edited");
++    if (!source.printable || !source.instances.front()->printable)
++        throw std::invalid_argument("Selected object is not printable");
++    const auto source_it = std::find_if(source.volumes.begin(), source.volumes.end(), [&](const ModelVolume* volume) {
++        return volume->id() == target.source_volume_id;
++    });
++    if (source_it == source.volumes.end() || !(*source_it)->is_model_part())
++        throw std::invalid_argument("The original model part has changed; refresh the object list");
++    if (target.generated_volume_ids.empty()) {
++        if (restore || source.volumes.size() != 1)
++            throw std::invalid_argument("Only an original single-part object can receive an anchor");
++        target.original_extruder = saved_option((*source_it)->config, "extruder");
++        target.original_brim = saved_option(source.config, "brim_type");
++    } else {
++        if (target.generated_volume_ids.size() != 2 || source.volumes.size() != 3 ||
++            target.generated_volume_ids[0] == target.generated_volume_ids[1])
++            throw std::invalid_argument("OpenAnchor parts changed; refusing to remove unknown parts");
++        const char* names[] = {"OpenAnchor flange", "OpenAnchor anchor + clamp"};
++        for (size_t i = 0; i < 2; ++i) {
++            const auto it = std::find_if(source.volumes.begin(), source.volumes.end(), [&](const ModelVolume* volume) {
++                return volume->id() == target.generated_volume_ids[i];
++            });
++            if (it == source.volumes.end() || *it == *source_it || (*it)->name != names[i] || !(*it)->is_model_part())
++                throw std::invalid_argument("OpenAnchor parts changed; refusing to remove unknown parts");
++        }
++    }
++    const Transform3d instance_matrix = source.instances.front()->get_transformation().get_matrix();
++    if (!instance_matrix.matrix().allFinite() || std::abs(instance_matrix.linear().determinant()) < 1e-12)
++        throw std::invalid_argument("Object transformation is not invertible");
++    if (!restore) {
++        if (main_slot < 1 || anchor_slot < 1 || main_slot == anchor_slot)
++            throw std::invalid_argument("Choose two different filament slots");
++        // Validate again in object coordinates after float conversion and mirrored transforms.
++        flange.transform(instance_matrix.inverse(), true);
++        anchor.transform(instance_matrix.inverse(), true);
++        flange = checked_mesh(std::move(flange.its));
++        anchor = checked_mesh(std::move(anchor.its));
++    }
++
++    StagedEdit edit{ObjectPtr(ModelAccess::copy(source)), target};
++    ModelAccess::attach(*edit.object, nullptr);
++    edit.object->cut_connectors = source.cut_connectors;
++    edit.object->volume_ids = source.volume_ids;
++    auto& volumes = edit.object->volumes;
++    // delete_volume collapses the last volume's transform and changes its ID; preserve the source exactly.
++    for (auto it = volumes.begin(); it != volumes.end();) {
++        if (std::find(target.generated_volume_ids.begin(), target.generated_volume_ids.end(), (*it)->id()) != target.generated_volume_ids.end()) {
++            delete *it;
++            it = volumes.erase(it);
++        } else
++            ++it;
++    }
++    edit.record.generated_volume_ids.clear();
++    if (restore) {
++        restore_option(volumes.front()->config, "extruder", target.original_extruder);
++        restore_option(edit.object->config, "brim_type", target.original_brim);
++    } else {
++        volumes.front()->config.set_key_value("extruder", new ConfigOptionInt(main_slot));
++        edit.object->config.set_key_value("brim_type", new ConfigOptionEnum<BrimType>(btNoBrim));
++        ModelVolume* flange_volume = edit.object->add_volume(std::move(flange), ModelVolumeType::MODEL_PART, false);
++        flange_volume->name = "OpenAnchor flange";
++        flange_volume->config.set_key_value("extruder", new ConfigOptionInt(main_slot));
++        ModelVolume* anchor_volume = edit.object->add_volume(std::move(anchor), ModelVolumeType::MODEL_PART, false);
++        anchor_volume->name = "OpenAnchor anchor + clamp";
++        anchor_volume->config.set_key_value("extruder", new ConfigOptionInt(anchor_slot));
++        edit.record.generated_volume_ids = {flange_volume->id(), anchor_volume->id()};
++    }
++    edit.object->invalidate_bounding_box();
++    return edit;
++}
++
++} // namespace Slic3r::anchor_plate
+diff --git a/tests/slic3rutils/test_anchor_plate_edit.cpp b/tests/slic3rutils/test_anchor_plate_edit.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/slic3rutils/test_anchor_plate_edit.cpp
+@@ -0,0 +1,150 @@
++#include <catch2/catch_test_macros.hpp>
++
++#include "libslic3r/Config.hpp"
++#include "libslic3r/Geometry.hpp"
++#include "libslic3r/Model.hpp"
++#include "libslic3r/Point.hpp"
++#include "libslic3r/PrintConfig.hpp"
++#include "libslic3r/TriangleMesh.hpp"
++#include "slic3r/plugin/host/AnchorPlateEdit.hpp"
++
++#include <limits>
++#include <cstddef>
++#include <string>
++#include <utility>
++
++using namespace Slic3r;
++
++namespace {
++ModelObject* add_source(Model& model)
++{
++    ModelObject* object = model.add_object("Original", "", make_cube(20., 20., 10.));
++    object->add_instance();
++    return object;
++}
++
++anchor_plate::Target target_for(const ModelObject& object)
++{
++    anchor_plate::Target target;
++    target.object_id = object.id();
++    target.source_volume_id = object.volumes.front()->id();
++    return target;
++}
++
++anchor_plate::StagedEdit apply(const ModelObject& object, anchor_plate::Target target)
++{
++    return anchor_plate::stage(object, std::move(target), false,
++        make_cube(25., 25., .6), make_cube(30., 30., 1.), 1, 2);
++}
++}
++
++TEST_CASE("Applying an anchor stages two parts without changing the live source", "[AnchorPlateEdit][Regression]")
++{
++    Model model;
++    const ModelObject* source = add_source(model);
++    const ModelObject* other = add_source(model);
++    const auto source_id = source->volumes.front()->id();
++    const auto instance_id = source->instances.front()->id();
++    auto edit = apply(*source, target_for(*source));
++    REQUIRE(source->volumes.size() == 1);
++    CHECK_FALSE(source->volumes.front()->config.has("extruder"));
++    CHECK_FALSE(source->config.has("brim_type"));
++    CHECK(model.objects[1] == other);
++    REQUIRE(edit.object->volumes.size() == 3);
++    CHECK(edit.object->id() == source->id());
++    CHECK(edit.object->volumes.front()->id() == source_id);
++    CHECK(edit.object->instances.front()->id() == instance_id);
++    CHECK(edit.object->get_model() == nullptr);
++    CHECK(edit.object->volumes[0]->config.extruder() == 1);
++    CHECK(edit.object->volumes[1]->config.extruder() == 1);
++    CHECK(edit.object->volumes[2]->config.extruder() == 2);
++    CHECK(edit.object->config.opt_serialize("brim_type") == ConfigOptionEnum<BrimType>(btNoBrim).serialize());
++    CHECK_FALSE(edit.record.original_extruder.has_value());
++    CHECK_FALSE(edit.record.original_brim.has_value());
++}
++
++TEST_CASE("Updating replaces only the expected generated parts and restoring preserves inheritance", "[AnchorPlateEdit][Regression]")
++{
++    Model model;
++    const ModelObject* source = add_source(model);
++    const auto source_id = source->volumes.front()->id();
++    auto first = apply(*source, target_for(*source));
++    auto second = apply(*first.object, first.record);
++    REQUIRE(second.object->volumes.size() == 3);
++    CHECK(second.object->volumes.front()->id() == source_id);
++    CHECK(second.record.generated_volume_ids[0] != first.record.generated_volume_ids[0]);
++    CHECK(second.record.generated_volume_ids[1] != first.record.generated_volume_ids[1]);
++    auto restored = anchor_plate::stage(*second.object, second.record, true);
++    REQUIRE(restored.object->volumes.size() == 1);
++    CHECK(restored.object->volumes.front()->id() == source_id);
++    CHECK_FALSE(restored.object->volumes.front()->config.has("extruder"));
++    CHECK_FALSE(restored.object->config.has("brim_type"));
++    CHECK(restored.record.generated_volume_ids.empty());
++    // A record from before an Undo cannot remove a newer pair of parts.
++    CHECK_THROWS(apply(*second.object, first.record));
++}
++
++TEST_CASE("Restoring retains explicit original settings and mirrored placement", "[AnchorPlateEdit][Regression]")
++{
++    Model model;
++    ModelObject* source = add_source(model);
++    source->volumes.front()->config.set_key_value("extruder", new ConfigOptionInt(3));
++    source->config.set_key_value("brim_type", new ConfigOptionEnum<BrimType>(btOuterOnly));
++    Transform3d transform = Transform3d::Identity();
++    transform.linear()(0, 0) = -2.;
++    transform.translation() = Vec3d(100., 80., 0.);
++    source->instances.front()->set_transformation(Geometry::Transformation(transform));
++    const Transform3d volume_transform = source->volumes.front()->get_transformation().get_matrix();
++    auto edit = apply(*source, target_for(*source));
++    CHECK(edit.object->instances.front()->get_transformation().get_matrix().matrix().isApprox(transform.matrix()));
++    TriangleMesh world = edit.object->volumes[1]->mesh();
++    world.transform(transform, true);
++    CHECK(world.bounding_box().min.isApprox(Vec3d::Zero(), 1e-5));
++    CHECK(world.bounding_box().max.isApprox(Vec3d(25., 25., .6), 1e-5));
++    auto restored = anchor_plate::stage(*edit.object, edit.record, true);
++    CHECK(restored.object->volumes.front()->config.extruder() == 3);
++    CHECK(restored.object->config.opt_serialize("brim_type") == source->config.opt_serialize("brim_type"));
++    CHECK(restored.object->volumes.front()->get_transformation().get_matrix().matrix().isApprox(volume_transform.matrix()));
++    CHECK(restored.object->instances.front()->get_transformation().get_matrix().matrix().isApprox(transform.matrix()));
++}
++
++TEST_CASE("Unknown or changed parts and instances are rejected before staging", "[AnchorPlateEdit][Regression]")
++{
++    Model model;
++    ModelObject* source = add_source(model);
++    auto target = target_for(*source);
++    SECTION("multiple instances") {
++        source->add_instance();
++        CHECK_THROWS(apply(*source, target));
++    }
++    SECTION("unknown multipart object") {
++        source->add_volume(make_cube(1., 1., 1.));
++        CHECK_THROWS(apply(*source, target));
++    }
++    SECTION("stale source ID") {
++        target.source_volume_id = ObjectID(std::numeric_limits<size_t>::max());
++        CHECK_THROWS(apply(*source, target));
++    }
++    SECTION("renamed generated volume") {
++        auto edit = apply(*source, target);
++        edit.object->volumes[1]->name = "User part";
++        CHECK_THROWS(apply(*edit.object, edit.record));
++        CHECK(edit.object->volumes.size() == 3);
++    }
++    SECTION("duplicate generated IDs") {
++        auto edit = apply(*source, target);
++        edit.record.generated_volume_ids[1] = edit.record.generated_volume_ids[0];
++        CHECK_THROWS(anchor_plate::stage(*edit.object, edit.record, true));
++    }
++}
++
++TEST_CASE("Malformed anchor meshes are rejected before native mesh construction", "[AnchorPlateEdit][Regression]")
++{
++    auto mesh = its_make_cube(10., 10., 1.);
++    SECTION("non-finite vertex") { mesh.vertices[0][0] = std::numeric_limits<float>::infinity(); }
++    SECTION("invalid index") { mesh.indices[0][0] = int(mesh.vertices.size()); }
++    SECTION("degenerate triangle") { mesh.indices[0][1] = mesh.indices[0][0]; }
++    SECTION("open edge") { mesh.indices.pop_back(); }
++    SECTION("reversed face") { std::swap(mesh.indices[0][0], mesh.indices[0][1]); }
++    CHECK_THROWS(anchor_plate::checked_mesh(std::move(mesh)));
++}

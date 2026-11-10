@@ -1,0 +1,11 @@
+{
+  "settings": {"flange_width": 5.0, "flange_height": 0.8, "anchor_width": 10.0, "gap": 0.1, "overlap": 2.0, "cap_thickness": 0.4, "clearance": 0.2, "main_slot": 1, "anchor_slot": 2},
+  "filament_slots": 2,
+  "multimaterial_confirmed": true,
+  "bed_polygon_mm": [[0,0],[256,0],[256,256],[0,256]],
+  "excluded_polygons_mm": [],
+  "initial_layer_height_mm": 0.2,
+  "layer_height_mm": 0.2,
+  "variable_layers": false,
+  "material": {"anchor_name": "PLA candidate - not validated", "bed_temperature": 80, "nozzle_temperature": 220}
+}
